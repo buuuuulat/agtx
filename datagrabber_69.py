@@ -60,7 +60,7 @@ class Recorder:
         stop_key: str = "F10",
         dev: bool = False,
         max_duration: Optional[float] = None,
-        operator: str = "",            # ← НОВОЕ: имя сборщика
+        operator: str = "",
     ):
         self.dataset_root = dataset_root
         self.rec_id = rec_id or f"rec_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -78,6 +78,7 @@ class Recorder:
         self.csv_path = os.path.join(self.rec_dir, "events.csv")
         self.meta_path = os.path.join(self.rec_dir, "meta.json")
         self.task_path = os.path.join(self.rec_dir, "task.txt")
+        self.stop_flag_path = os.path.join(self.rec_dir, ".stop")  # ← ФЛАГ ОСТАНОВКИ (файлом)
         os.makedirs(self.frames_dir, exist_ok=True)
 
         self.events_q = SafeDeque()
@@ -186,7 +187,7 @@ class Recorder:
             "monitor": monitor,
             "notes": "Все события между кадрами i и i+1 приписаны к кадру i.",
             "stop_key": self.stop_key_name,
-            "operator": self.operator,         # ← НОВОЕ
+            "operator": self.operator,
         }
         with open(self.meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -215,6 +216,13 @@ class Recorder:
 
     # ---------- record ----------
     def record(self):
+        # удалить старый .stop, если остался
+        try:
+            if os.path.exists(self.stop_flag_path):
+                os.remove(self.stop_flag_path)
+        except Exception:
+            pass
+
         kb_listener = keyboard.Listener(on_press=self._kb_on_press, on_release=self._kb_on_release)
         ms_listener = mouse.Listener(on_move=self._ms_on_move, on_click=self._ms_on_click, on_scroll=self._ms_on_scroll)
         kb_listener.start()
@@ -246,11 +254,17 @@ class Recorder:
                     "row_type": "frame", "frame_id": frame_id, "time_s": round(t_rel, 6),
                     "event_type": "frame", "frame_path": os.path.relpath(frame_path, self.rec_dir),
                 })
+                csv_file.flush()
                 self._frames_captured += 1
                 next_capture = self._start_perf + self.dt
 
                 # Цикл
                 while not self._stop_flag.is_set():
+                    # аварийный стоп-файл
+                    if os.path.exists(self.stop_flag_path):
+                        self._stop_flag.set()
+                        break
+
                     while True:
                         now_abs = time.perf_counter()
                         remaining = next_capture - now_abs
@@ -287,6 +301,7 @@ class Recorder:
                                         "key_code": ev.payload.get("key_code"),
                                         "modifiers": ev.payload.get("modifiers")})
                         writer.writerow(row)
+                        csv_file.flush()
                         self._events_written += 1
 
                     frame_path = os.path.join(self.frames_dir, f"{next_frame_id:06d}.png")
@@ -296,6 +311,7 @@ class Recorder:
                         "time_s": round(t_boundary_rel, 6), "event_type": "frame",
                         "frame_path": os.path.relpath(frame_path, self.rec_dir),
                     })
+                    csv_file.flush()
                     self._frames_captured += 1
 
                     frame_id = next_frame_id
@@ -305,6 +321,7 @@ class Recorder:
                     if self.max_duration is not None and self._now_rel() >= self.max_duration:
                         self._stop_flag.set()
 
+                # добираем «хвост» событий
                 for ev in self.events_q.drain_all():
                     row = {
                         "row_type": "event", "frame_id": frame_id,
@@ -329,12 +346,19 @@ class Recorder:
                                     "key_code": ev.payload.get("key_code"),
                                     "modifiers": ev.payload.get("modifiers")})
                     writer.writerow(row)
+                    csv_file.flush()
                     self._events_written += 1
             finally:
                 csv_file.close()
 
         kb_listener.stop()
         ms_listener.stop()
+        try:
+            if os.path.exists(self.stop_flag_path):
+                os.remove(self.stop_flag_path)
+        except Exception:
+            pass
+
         if self.dev:
             print(f"[DEV] Finished. frames={self._frames_captured}, events={self._events_written}")
 
@@ -349,7 +373,7 @@ def parse_args():
     p.add_argument("--stop-key", type=str, default="F10")
     p.add_argument("--dev", action="store_true")
     p.add_argument("--max-duration", type=float, default=None)
-    p.add_argument("--operator", type=str, default="", help="Имя сборщика (запишется в meta.json)")  # ← НОВОЕ
+    p.add_argument("--operator", type=str, default="", help="Имя сборщика (запишется в meta.json)")
     return p.parse_args()
 
 
@@ -364,7 +388,7 @@ def main():
         stop_key=args.stop_key,
         dev=args.dev,
         max_duration=args.max_duration,
-        operator=args.operator,  # ← НОВОЕ
+        operator=args.operator,
     )
 
     def _graceful_stop(signum, frame):

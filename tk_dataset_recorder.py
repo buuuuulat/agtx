@@ -1,109 +1,59 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Мини-GUI для сбора датасета
-- Только две кнопки: Старт/Стоп
-- Показывает задание и таймер
-- Автопоиск файла рекордера (datagrabber_69.py)
-- Имя сборщика из переменной окружения OPERATOR_NAME → meta.json
-- Рекордер запускается в отдельном процессе; мягкая остановка SIGINT→TERM→KILL
+Tk Dataset Recorder — простая панель для сборщика
+
+• Две кнопки: «Начать запись» / «Завершить и отправить»
+• НЕТ остановки по Esc (бинд убран), аварийная клавиша GUI — Cmd+. (macOS) — опционально
+• Надёжная остановка: создаём rec_dir/.stop + шлём сигналы в ГРУППУ процесса (SIGINT→TERM→KILL)
+• Автосворачивание при старте (iconify), авторазворачивание после остановки
+• Меню «Датасет»: экспорт в ZIP и очистка
+• Индикатор размера датасета (обновляется каждые 2с)
+
+ENV:
+  DATASET_ROOT=./dataset
+  OPERATOR_NAME="Имя сборщика"
+  STOP_KEY=""             # ПУСТО по умолчанию → не передавать хоткей в рекордер
+  HIDE_ON_START=1         # 1 — сворачивать при старте (по умолчанию), 0 — нет
+  RECORD_START_DELAY_MS=250
+  RECORDER_SCRIPT=/path/to/datagrabber_69.py   # если не лежит рядом
 """
 from __future__ import annotations
 
-import json
-import os
-import platform
-import signal
-import subprocess
-import sys
-import threading
-import time
+import json, os, platform, signal, subprocess, sys, threading, time, shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
-
-# --------- Task providers (API или локальный список) ---------
+# -------- задачи --------
 @dataclass
 class Task:
     task_id: str
     text: str
 
-
 class TaskProvider:
-    def get_next_task(self) -> Optional[Task]:
-        raise NotImplementedError
-
-    def submit_result(self, task_id: str, rec_id: str, meta: Dict[str, Any]) -> None:
-        raise NotImplementedError
-
-
-class HTTPTaskProvider(TaskProvider):
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
-
-    def _http_get(self, path: str) -> Dict[str, Any]:
-        import urllib.request
-        url = f"{self.base_url}{path}"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read().decode("utf-8")
-        return json.loads(data)
-
-    def _http_post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        import urllib.request
-        url = f"{self.base_url}{path}"
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read().decode("utf-8")
-        return json.loads(data) if data else {"ok": True}
-
-    def get_next_task(self) -> Optional[Task]:
-        try:
-            data = self._http_get("/next_task")
-            if not data or "text" not in data:
-                return None
-            return Task(task_id=str(data.get("task_id", "")), text=str(data["text"]))
-        except Exception:
-            return None
-
-    def submit_result(self, task_id: str, rec_id: str, meta: Dict[str, Any]) -> None:
-        payload = {"task_id": task_id, "rec_id": rec_id, "meta": meta}
-        try:
-            _ = self._http_post_json("/submit", payload)
-        except Exception:
-            pass
-
+    def get_next_task(self) -> Optional[Task]: raise NotImplementedError
+    def submit_result(self, task_id: str, rec_id: str, meta: Dict[str, Any]) -> None: raise NotImplementedError
 
 class LocalListTaskProvider(TaskProvider):
     def __init__(self, tasks: List[str]):
-        self.tasks = [t for t in tasks if str(t).strip()]
-        self.idx = 0
-
+        self.tasks = [t for t in tasks if str(t).strip()]; self.idx = 0
     def get_next_task(self) -> Optional[Task]:
-        if self.idx >= len(self.tasks):
-            return None
-        t = self.tasks[self.idx]
-        self.idx += 1
+        if self.idx >= len(self.tasks): return None
+        t = self.tasks[self.idx]; self.idx += 1
         return Task(task_id=f"local_{self.idx}", text=t)
+    def submit_result(self, task_id: str, rec_id: str, meta: Dict[str, Any]) -> None: return
 
-    def submit_result(self, task_id: str, rec_id: str, meta: Dict[str, Any]) -> None:
-        return
-
-
-# ------------------- Мини-GUI -------------------
+# -------- GUI --------
 class App(tk.Tk):
     def __init__(self, provider: TaskProvider):
         super().__init__()
         self.title("Dataset Recorder")
-        # компактное окно
-        self.geometry("520x360")
-        self.minsize(480, 320)
+        self.geometry("540x360"); self.minsize(500, 330)
 
         self.provider = provider
         self.current_task: Optional[Task] = None
@@ -112,254 +62,361 @@ class App(tk.Tk):
         self.rec_start_time: Optional[float] = None
         self._timer_job = None
 
-        # заранее вытащим имя оператора (в UI не показываем — минимум элементов)
+        self.dataset_root_dir = Path(os.environ.get("DATASET_ROOT", "./dataset")).resolve()
         self.operator = self._detect_operator()
+        # ВАЖНО: по умолчанию пусто → не передаём --stop-key; Esc НЕ останавливает запись
+        self._stop_key = os.environ.get("STOP_KEY", "").strip()
+        # если кто-то всё же выставил ESC — глушим, чтобы гарантированно не работало
+        if self._stop_key.upper() == "ESC":
+            self._stop_key = ""
+        self.auto_minimize = os.environ.get("HIDE_ON_START", "1") != "0"
+        self.start_delay_ms = int(os.environ.get("RECORD_START_DELAY_MS", "250"))
 
-        # стили (зелёная/красная кнопки)
         self._init_styles()
-
-        # UI
         self._build_ui()
+        self._bind_hotkeys()
 
-        # первая задача
+        self._size_thread_running = False; self._size_job = None
+        self._schedule_size_tick()
+
         self._fetch_and_show_next_task()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---- цвета кнопок ----
+    # ---- стили ----
     def _init_styles(self):
         self.style = ttk.Style(self)
-        try:
-            self.style.theme_use("clam")  # чтобы цвета применялись и на macOS
-        except Exception:
-            pass
+        try: self.style.theme_use("clam")
+        except Exception: pass
         self.style.configure("Start.TButton", background="#22c55e", foreground="white",
                              padding=8, font=("SF Pro Text", 12, "bold"))
-        self.style.map("Start.TButton",
-                       background=[("active", "#16a34a"), ("disabled", "#86efac")],
-                       foreground=[("disabled", "#ffffff")])
-
+        self.style.map("Start.TButton", background=[("active","#16a34a"),("disabled","#86efac")])
         self.style.configure("Stop.TButton", background="#ef4444", foreground="white",
                              padding=8, font=("SF Pro Text", 12, "bold"))
-        self.style.map("Stop.TButton",
-                       background=[("active", "#dc2626"), ("disabled", "#fca5a5")],
-                       foreground=[("disabled", "#ffffff")])
+        self.style.map("Stop.TButton", background=[("active","#dc2626"),("disabled","#fca5a5")])
 
-    # ---- компоновка ----
+    # ---- UI ----
     def _build_ui(self):
-        # текст задания
         box = ttk.LabelFrame(self, text="Задание")
-        box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
+        box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10,6))
         self.task_text = tk.Text(box, height=6, wrap=tk.WORD)
         self.task_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.task_text.configure(state=tk.DISABLED)
 
-        # статус + таймер
-        status = ttk.Frame(self)
-        status.pack(fill=tk.X, padx=10, pady=(4, 6))
-        self.status_var = tk.StringVar(value="Готово")
-        ttk.Label(status, textvariable=self.status_var).pack(side=tk.LEFT)
+        status = ttk.Frame(self); status.pack(fill=tk.X, padx=10, pady=(4,6))
+        self.status_var = tk.StringVar(value="Готово"); ttk.Label(status, textvariable=self.status_var).pack(side=tk.LEFT)
         self.timer_var = tk.StringVar(value="00:00")
-        ttk.Label(status, text=" | ").pack(side=tk.LEFT)
-        ttk.Label(status, text="Время:").pack(side=tk.LEFT)
+        ttk.Label(status, text=" | ").pack(side=tk.LEFT); ttk.Label(status, text="Время:").pack(side=tk.LEFT)
         ttk.Label(status, textvariable=self.timer_var).pack(side=tk.LEFT)
 
-        # две большие кнопки
-        btns = ttk.Frame(self)
-        btns.pack(fill=tk.X, padx=10, pady=(2, 10))
-        self.btn_start = ttk.Button(btns, text="Начать запись", style="Start.TButton", command=self.on_start)
+        right = ttk.Frame(status); right.pack(side=tk.RIGHT)
+        self.dataset_size_var = tk.StringVar(value="Размер: —")
+        ttk.Label(right, textvariable=self.dataset_size_var).pack(side=tk.LEFT, padx=(0,8))
+        ds_menu_btn = tk.Menubutton(right, text="Датасет ▾")
+        ds_menu = tk.Menu(ds_menu_btn, tearoff=0)
+        ds_menu.add_command(label="Экспорт в ZIP…", command=self._export_zip)
+        ds_menu.add_command(label="Очистить…", command=self._clear_dataset)
+        ds_menu_btn.config(menu=ds_menu); ds_menu_btn.pack(side=tk.LEFT)
+
+        btns = ttk.Frame(self); btns.pack(fill=tk.X, padx=10, pady=(2,10))
+        self.btn_start = ttk.Button(btns, text="Начать запись", style="Start.TButton",
+                                    command=self.on_start, takefocus=True)
         self.btn_start.pack(side=tk.LEFT, expand=True, fill=tk.X)
-        self.btn_finish = ttk.Button(btns, text="Завершить и отправить", style="Stop.TButton", command=self.on_finish)
-        self.btn_finish.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(8, 0))
-        self.btn_finish.configure(state=tk.DISABLED)
+        self.btn_finish = ttk.Button(btns, text="Завершить и отправить", style="Stop.TButton",
+                                     command=self.on_finish, takefocus=True)
+        self.btn_finish.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(8,0))
+        self.btn_finish.state(["disabled"])  # управляем состоянием через state()
+
+    # ---- хоткеи ----
+    def _bind_hotkeys(self):
+        pass
+        # Esc — УБРАН, чтобы случайно не останавливать
+        #if platform.system() == "Darwin":
+            # оставим аварийный хоткей Cmd+. (можешь удалить, если нужно совсем без клавиш)
+            # self.bind_all("<Command-period>", lambda e: self.on_finish())
 
     # ---- задачи ----
     def _fetch_and_show_next_task(self):
         self.current_task = self.provider.get_next_task()
         self._set_task_text(self.current_task.text if self.current_task else "Задачи закончились. Спасибо!")
-        self.btn_start.configure(state=tk.NORMAL if self.current_task else tk.DISABLED)
+        self.btn_start.state(["!disabled"] if self.current_task else ["disabled"])
 
     def _set_task_text(self, text: str):
-        self.task_text.configure(state=tk.NORMAL)
-        self.task_text.delete("1.0", tk.END)
-        self.task_text.insert(tk.END, text)
-        self.task_text.configure(state=tk.DISABLED)
+        self.task_text.configure(state=tk.NORMAL); self.task_text.delete("1.0", tk.END)
+        self.task_text.insert(tk.END, text); self.task_text.configure(state=tk.DISABLED)
 
-    # ---- старт/стоп ----
+    # ---- старт ----
     def on_start(self):
-        if self.recording or not self.current_task:
+        if self.rec_proc is not None:  # уже идёт
             return
+        if not self.current_task:
+            messagebox.showwarning("Нет задания", "Заданий сейчас нет."); return
 
         script_path = self._find_recorder_script()
         if not script_path:
             messagebox.showerror("Рекордер не найден",
-                                 "Не найден файл рекордера: datagrabber_69.py (или задайте RECORDER_SCRIPT).")
-            return
+                                 "Не найден datagrabber_69.py рядом с GUI (или укажи RECORDER_SCRIPT)."); return
 
         rec_id = f"rec_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        cmd = [
-            sys.executable, str(script_path),
-            "--rec-id", rec_id,
-            "--task", self.current_task.text,
-            # Остальные параметры берутся из дефолтов рекордера
-        ]
+        rec_dir = self.dataset_root_dir / rec_id
+
+        # Формируем команду запуска
+        if str(script_path).lower().endswith(".py"):
+            cmd = [sys.executable, str(script_path)]
+        else:
+            cmd = [str(script_path)]
+        cmd += ["--rec-id", rec_id, "--task", self.current_task.text]
+
+        # хоткей больше не передаём по умолчанию; если явно задан и НЕ Esc — добавим
+        if self._stop_key:
+            cmd += ["--stop-key", self._stop_key]
+        # имя оператора (если есть)
         if self.operator:
             cmd += ["--operator", self.operator]
 
         if platform.system() == "Darwin":
-            self._maybe_show_mac_perms_hint()
+            print("[INFO] macOS: если запись не стартует, дайте права Terminal/PyCharm в Privacy & Security → "
+                  "Screen Recording / Input Monitoring / Accessibility")
+
+        # свернуть окно перед стартом
+        if self.auto_minimize:
+            try:
+                self.iconify(); self.update_idletasks(); time.sleep(self.start_delay_ms/1000.0)
+            except Exception: pass
 
         try:
-            self.rec_proc = subprocess.Popen(cmd)
+            # новая сессия → можно послать сигнал всей группе
+            self.rec_proc = subprocess.Popen(cmd, start_new_session=True)
         except Exception as e:
-            messagebox.showerror("Не удалось запустить запись", str(e))
-            return
+            try: self.deiconify(); self.lift(); self.focus_force()
+            except Exception: pass
+            messagebox.showerror("Не удалось запустить запись", str(e)); return
 
         self.recording = True
-        self.rec_start_time = time.time()
-        self._tick_timer()
-        self.btn_start.configure(state=tk.DISABLED)
-        self.btn_finish.configure(state=tk.NORMAL)
+        self._current_rec = {"rec_id": rec_id, "rec_dir": str(rec_dir)}
+        self.rec_start_time = time.time(); self._tick_timer()
+        self.btn_start.state(["disabled"]); self.btn_finish.state(["!disabled"])
+        self.btn_finish.focus_set()
         self.status_var.set(f"Запись идёт → {rec_id}")
 
-        # фон: ждём завершения процесса
         def watcher():
-            if self.rec_proc is None:
-                return
+            if self.rec_proc is None: return
             rc = self.rec_proc.wait()
             self.after(0, lambda: self._on_recorder_stopped(rc, rec_id))
-
         threading.Thread(target=watcher, daemon=True).start()
-        self._current_rec = {"rec_id": rec_id, "root": "./dataset"}  # корень по умолчанию в рекордере
 
+    # ---- стоп ----
     def on_finish(self):
-        if not self.recording or self.rec_proc is None:
-            return
+        if self.rec_proc is None:
+            self.status_var.set("Нет активной записи"); return
+
         self.status_var.set("Завершаю запись…")
+
+        # 1) аварийный флаг .stop
+        try:
+            rec_dir = Path(self._current_rec.get("rec_dir","")) if hasattr(self,"_current_rec") else None
+            if rec_dir:
+                rec_dir.mkdir(parents=True, exist_ok=True)
+                (rec_dir / ".stop").touch()
+        except Exception: pass
+
+        # 2) шлём сигналы всей группе процесса
+        try:
+            import os
+            pgid = os.getpgid(self.rec_proc.pid)
+        except Exception:
+            pgid = None
+
+        def kill_group(sig):
+            try:
+                if pgid is not None: os.killpg(pgid, sig)
+                else: self.rec_proc.send_signal(sig)
+            except Exception: pass
+
         try:
             if self.rec_proc.poll() is None:
-                self.rec_proc.send_signal(signal.SIGINT)
+                kill_group(signal.SIGINT)
                 for _ in range(30):
-                    if self.rec_proc.poll() is not None:
-                        break
+                    if self.rec_proc.poll() is not None: break
                     time.sleep(0.1)
             if self.rec_proc.poll() is None:
-                self.rec_proc.terminate()
+                kill_group(signal.SIGTERM)
                 for _ in range(30):
-                    if self.rec_proc.poll() is not None:
-                        break
+                    if self.rec_proc.poll() is not None: break
                     time.sleep(0.1)
             if self.rec_proc.poll() is None:
-                self.rec_proc.kill()
+                kill_group(signal.SIGKILL)
         except Exception:
             pass
 
-    # ---- хелперы ----
+    # ---- экспорт/очистка ----
+    def _export_zip(self):
+        default_name = f"dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        save_path = filedialog.asksaveasfilename(title="Экспорт датасета в ZIP",
+            defaultextension=".zip", initialfile=default_name, filetypes=[("ZIP archive","*.zip")])
+        if not save_path: return
+        def worker():
+            try:
+                self._set_dataset_actions_enabled(False); self.status_var.set("Экспортирую в ZIP…")
+                base = Path(save_path); base_no_ext = str(base.with_suffix(""))
+                shutil.make_archive(base_no_ext, "zip",
+                    root_dir=str(self.dataset_root_dir.parent), base_dir=self.dataset_root_dir.name)
+                self.after(0, lambda: messagebox.showinfo("Готово", f"Экспортировано:\n{save_path}"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Ошибка экспорта", str(e)))
+            finally:
+                self.after(0, lambda: (self._set_dataset_actions_enabled(True), self.status_var.set("Готово")))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _clear_dataset(self):
+        if self.rec_proc is not None and self.rec_proc.poll() is None:
+            messagebox.showwarning("Идёт запись", "Нельзя очищать датасет во время записи."); return
+        if not self.dataset_root_dir.exists():
+            messagebox.showinfo("Пусто", "Папка датасета ещё не создана."); return
+        ok = messagebox.askyesno("Очистить датасет?",
+            f"Будут удалены ВСЕ записи в:\n{self.dataset_root_dir}\n\nПродолжить?", icon="warning")
+        if not ok: return
+        def worker():
+            try:
+                self._set_dataset_actions_enabled(False); self.status_var.set("Очищаю датасет…")
+                for entry in self.dataset_root_dir.iterdir():
+                    try:
+                        if entry.is_dir(): shutil.rmtree(entry)
+                        else: entry.unlink()
+                    except Exception: pass
+                self.after(0, lambda: messagebox.showinfo("Готово", "Датасет очищен."))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Ошибка очистки", str(e)))
+            finally:
+                self.after(0, lambda: (self._set_dataset_actions_enabled(True), self.status_var.set("Готово")))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_dataset_actions_enabled(self, enabled: bool):
+        self.btn_start.state(["!disabled"] if (enabled and self.current_task and self.rec_proc is None) else ["disabled"])
+        self.btn_finish.state(["!disabled"] if (enabled and self.rec_proc is not None) else ["disabled"])
+
+    # ---- размер датасета ----
+    def _schedule_size_tick(self): self._size_job = self.after(2000, self._size_tick)
+    def _size_tick(self):
+        if self._size_thread_running: return self._schedule_size_tick()
+        def worker():
+            self._size_thread_running = True
+            try:
+                size = self._dir_size_bytes(self.dataset_root_dir)
+                self.after(0, lambda: self.dataset_size_var.set(f"Размер: {self._format_size(size)}"))
+            finally:
+                self._size_thread_running = False; self._schedule_size_tick()
+        threading.Thread(target=worker, daemon=True).start()
+    @staticmethod
+    def _dir_size_bytes(path: Path) -> int:
+        if not path.exists(): return 0
+        total = 0; stack = [path]
+        while stack:
+            p = stack.pop()
+            try:
+                with os.scandir(p) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_symlink(): continue
+                            if entry.is_dir(follow_symlinks=False): stack.append(Path(entry.path))
+                            else: total += entry.stat(follow_symlinks=False).st_size
+                        except Exception: continue
+            except Exception: continue
+        return total
+    @staticmethod
+    def _format_size(n: int) -> str:
+        units = ["B","KB","MB","GB","TB"]; i=0; val=float(n)
+        while val>=1024 and i<len(units)-1: val/=1024.0; i+=1
+        return f"{val:.1f} {units[i]}" if i>0 else f"{int(val)} {units[i]}"
+
+    # ---- watcher завершение ----
     def _on_recorder_stopped(self, returncode: Optional[int], rec_id: str):
-        if not self.recording:
-            return
+        # вернуть окно, если было свёрнуто
+        try: self.deiconify(); self.lift(); self.focus_force()
+        except Exception: pass
+
         self.recording = False
         if self._timer_job is not None:
-            try:
-                self.after_cancel(self._timer_job)
-            except Exception:
-                pass
+            try: self.after_cancel(self._timer_job)
+            except Exception: pass
             self._timer_job = None
         self.timer_var.set("00:00")
-        self.btn_finish.configure(state=tk.DISABLED)
+        self.btn_finish.state(["disabled"])
 
-        # не считаем -2 (SIGINT) ошибкой
         if returncode not in (None, 0, -2):
             if returncode == -5:
-                message = (
-                    "Запись завершилась с ошибкой (SIGTRAP).\n\n"
-                    "Обычно это отсутствие прав на Screen Recording / Input Monitoring.\n\n"
-                    "System Settings → Privacy & Security →\n"
-                    "• Screen Recording\n• Input Monitoring\n• Accessibility\n\n"
-                    "Добавьте Terminal или PyCharm, затем перезапустите их."
-                )
-                messagebox.showerror("Нет прав (macOS)", message)
+                messagebox.showerror("Нет прав (macOS)",
+                    "SIGTRAP: вероятно, нет прав Screen Recording/Input Monitoring/Accessibility.\n"
+                    "System Settings → Privacy & Security → добавьте Terminal/PyCharm и перезапустите их.")
             else:
                 messagebox.showerror("Ошибка записи", f"Дочерний процесс завершился с кодом: {returncode}")
 
-        # submit (если есть API)
+        # submit (если нужно)
         try:
-            rec_dir = Path("./dataset") / rec_id
+            rec_dir = self.dataset_root_dir / rec_id
             meta_path = rec_dir / "meta.json"
-            meta = {}
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if self.current_task:
-                self.provider.submit_result(self.current_task.task_id, rec_id, meta)
-        except Exception:
-            pass
+            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            if self.current_task: self.provider.submit_result(self.current_task.task_id, rec_id, meta)
+        except Exception: pass
 
-        # следующее задание
         self._fetch_and_show_next_task()
         self.status_var.set("Готово")
-        self.btn_start.configure(state=tk.NORMAL if self.current_task else tk.DISABLED)
         self.rec_proc = None
+        self.btn_start.state(["!disabled"] if self.current_task else ["disabled"])
 
+    # ---- утилиты ----
     def _tick_timer(self):
-        if not self.recording or self.rec_start_time is None:
-            return
-        dt = int(time.time() - self.rec_start_time)
-        mm, ss = divmod(dt, 60)
+        if self.rec_start_time is None: return
+        dt = int(time.time() - self.rec_start_time); mm, ss = divmod(dt, 60)
         self.timer_var.set(f"{mm:02d}:{ss:02d}")
         self._timer_job = self.after(1000, self._tick_timer)
 
-    def _maybe_show_mac_perms_hint(self):
-        msg = (
-            "Если запись не стартует/падает на macOS — проверьте права:\n\n"
-            "System Settings → Privacy & Security →\n"
-            "• Screen Recording\n• Input Monitoring\n• Accessibility\n\n"
-            "Добавьте Terminal или PyCharm и перезапустите их."
-        )
-        print("[INFO] macOS permissions hint:\n" + msg)
-
     def _find_recorder_script(self) -> Optional[Path]:
-        # 1) переменная окружения
-        env_path = os.environ.get("RECORDER_SCRIPT", "").strip()
-        if env_path and Path(env_path).exists():
-            return Path(env_path).resolve()
-        # 2) популярные имена рядом с GUI (предпочтение datagrabber_69.py)
+        env_path = os.environ.get("RECORDER_SCRIPT","").strip()
+        if env_path and Path(env_path).exists(): return Path(env_path).resolve()
         here = Path(__file__).parent
-        for name in ("datagrabber_69.py", "pc_screen_dataset_recorder.py"):
-            p = here / name
-            if p.exists():
-                return p.resolve()
-        return None
+        p = here / "datagrabber_69.py"
+        return p.resolve() if p.exists() else None
 
     def _detect_operator(self) -> str:
-        op = os.environ.get("OPERATOR_NAME", "").strip()
-        if op:
-            return op
+        op = os.environ.get("OPERATOR_NAME","").strip()
+        if op: return op
         try:
-            import getpass
-            return getpass.getuser()
-        except Exception:
-            return ""
+            import getpass; return getpass.getuser()
+        except Exception: return ""
 
+    def _on_close(self):
+        # мягко остановим запись при закрытии
+        try:
+            if self.rec_proc and self.rec_proc.poll() is None:
+                if hasattr(self,"_current_rec"):
+                    try: (Path(self._current_rec["rec_dir"]) / ".stop").touch()
+                    except Exception: pass
+                try:
+                    import os; pgid = os.getpgid(self.rec_proc.pid); os.killpg(pgid, signal.SIGINT)
+                except Exception:
+                    self.rec_proc.send_signal(signal.SIGINT)
+        except Exception: pass
+        # очистка таймеров
+        if self._timer_job is not None:
+            try: self.after_cancel(self._timer_job)
+            except Exception: pass
+            self._timer_job = None
+        if self._size_job is not None:
+            try: self.after_cancel(self._size_job)
+            except Exception: pass
+            self._size_job = None
+        self.destroy()
 
-# --------- фабрика провайдера задач ---------
 def make_provider_from_env() -> TaskProvider:
-    base = os.environ.get("TASK_API_BASE", "").strip()
-    if base:
-        return HTTPTaskProvider(base)
-
-    tasks_json = os.environ.get("TASKS_JSON", "").strip()
+    tasks_json = os.environ.get("TASKS_JSON","").strip()
     if tasks_json and Path(tasks_json).exists():
         tasks = json.loads(Path(tasks_json).read_text(encoding="utf-8"))
-        if isinstance(tasks, list):
-            return LocalListTaskProvider([str(t) for t in tasks])
-
-    # дефолтные демо-задачи
+        if isinstance(tasks, list): return LocalListTaskProvider([str(t) for t in tasks])
     return LocalListTaskProvider([
         "Откройте браузер и найдите погоду в Амстердаме",
         "Создайте документ и сохраните его на рабочий стол",
         "Откройте почту и подготовьте черновик письма другу",
     ])
 
-
 if __name__ == "__main__":
-    provider = make_provider_from_env()
-    app = App(provider)
-    app.mainloop()
+    app = App(make_provider_from_env()); app.mainloop()
