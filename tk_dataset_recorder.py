@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tk Dataset Recorder — простая панель для сборщика
+Tk Dataset Recorder — простая панель для сборщика.
 
-• Две кнопки: «Начать запись» / «Завершить и отправить»
-• НЕТ остановки по Esc (бинд убран), аварийная клавиша GUI — Cmd+. (macOS) — опционально
-• Надёжная остановка: создаём rec_dir/.stop + шлём сигналы в ГРУППУ процесса (SIGINT→TERM→KILL)
-• Автосворачивание при старте (iconify), авторазворачивание после остановки
-• Меню «Датасет»: экспорт в ZIP и очистка
-• Индикатор размера датасета (обновляется каждые 2с)
+Готов к упаковке PyInstaller (находит рекордер рядом с exe/app).
+Нет остановки по Esc. Окно сворачивается при старте, разворачивается после стопа.
+Меню «Датасет»: экспорт в ZIP и очистка. Индикатор размера папки.
 
-ENV:
+ENV (опционально):
   DATASET_ROOT=./dataset
   OPERATOR_NAME="Имя сборщика"
-  STOP_KEY=""             # ПУСТО по умолчанию → не передавать хоткей в рекордер
-  HIDE_ON_START=1         # 1 — сворачивать при старте (по умолчанию), 0 — нет
+  STOP_KEY=""                 # пусто → не передавать хоткей в рекордер
+  HIDE_ON_START=1             # 1 — сворачивать окно при старте
   RECORD_START_DELAY_MS=250
-  RECORDER_SCRIPT=/path/to/datagrabber_69.py   # если не лежит рядом
+  RECORDER_BIN=/abs/path/to/datagrabber_69(.exe)  # если надо указать явно
 """
 from __future__ import annotations
 
@@ -64,10 +61,8 @@ class App(tk.Tk):
 
         self.dataset_root_dir = Path(os.environ.get("DATASET_ROOT", "./dataset")).resolve()
         self.operator = self._detect_operator()
-        # ВАЖНО: по умолчанию пусто → не передаём --stop-key; Esc НЕ останавливает запись
         self._stop_key = os.environ.get("STOP_KEY", "").strip()
-        # если кто-то всё же выставил ESC — глушим, чтобы гарантированно не работало
-        if self._stop_key.upper() == "ESC":
+        if self._stop_key.upper() == "ESC":  # принудительно запрещаем Esc
             self._stop_key = ""
         self.auto_minimize = os.environ.get("HIDE_ON_START", "1") != "0"
         self.start_delay_ms = int(os.environ.get("RECORD_START_DELAY_MS", "250"))
@@ -124,15 +119,13 @@ class App(tk.Tk):
         self.btn_finish = ttk.Button(btns, text="Завершить и отправить", style="Stop.TButton",
                                      command=self.on_finish, takefocus=True)
         self.btn_finish.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(8,0))
-        self.btn_finish.state(["disabled"])  # управляем состоянием через state()
+        self.btn_finish.state(["disabled"])
 
     # ---- хоткеи ----
     def _bind_hotkeys(self):
-        pass
-        # Esc — УБРАН, чтобы случайно не останавливать
-        #if platform.system() == "Darwin":
-            # оставим аварийный хоткей Cmd+. (можешь удалить, если нужно совсем без клавиш)
-            # self.bind_all("<Command-period>", lambda e: self.on_finish())
+        # Esc не используем. Оставим (опционально) Cmd+. на macOS:
+        if platform.system() == "Darwin":
+            self.bind_all("<Command-period>", lambda e: self.on_finish())
 
     # ---- задачи ----
     def _fetch_and_show_next_task(self):
@@ -146,45 +139,38 @@ class App(tk.Tk):
 
     # ---- старт ----
     def on_start(self):
-        if self.rec_proc is not None:  # уже идёт
-            return
-        if not self.current_task:
-            messagebox.showwarning("Нет задания", "Заданий сейчас нет."); return
+        if self.rec_proc is not None or not self.current_task: return
 
-        script_path = self._find_recorder_script()
-        if not script_path:
+        rec_bin = self._find_recorder_binary()
+        if not rec_bin:
             messagebox.showerror("Рекордер не найден",
-                                 "Не найден datagrabber_69.py рядом с GUI (или укажи RECORDER_SCRIPT)."); return
+                "Не найден ни datagrabber_69(.exe), ни datagrabber_69 рядом, ни datagrabber_69.py")
+            return
 
         rec_id = f"rec_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         rec_dir = self.dataset_root_dir / rec_id
 
-        # Формируем команду запуска
-        if str(script_path).lower().endswith(".py"):
-            cmd = [sys.executable, str(script_path)]
+        # Сформировать команду (поддерживаем как бинарь, так и .py)
+        if rec_bin.suffix.lower() == ".py":
+            cmd = [sys.executable, str(rec_bin)]
         else:
-            cmd = [str(script_path)]
+            cmd = [str(rec_bin)]
         cmd += ["--rec-id", rec_id, "--task", self.current_task.text]
 
-        # хоткей больше не передаём по умолчанию; если явно задан и НЕ Esc — добавим
-        if self._stop_key:
+        if self._stop_key:  # по умолчанию пусто → не передаём
             cmd += ["--stop-key", self._stop_key]
-        # имя оператора (если есть)
         if self.operator:
             cmd += ["--operator", self.operator]
 
         if platform.system() == "Darwin":
-            print("[INFO] macOS: если запись не стартует, дайте права Terminal/PyCharm в Privacy & Security → "
+            print("[INFO] macOS: если запись не стартует, дайте права в Privacy & Security → "
                   "Screen Recording / Input Monitoring / Accessibility")
 
-        # свернуть окно перед стартом
         if self.auto_minimize:
-            try:
-                self.iconify(); self.update_idletasks(); time.sleep(self.start_delay_ms/1000.0)
+            try: self.iconify(); self.update_idletasks(); time.sleep(self.start_delay_ms/1000.0)
             except Exception: pass
 
         try:
-            # новая сессия → можно послать сигнал всей группе
             self.rec_proc = subprocess.Popen(cmd, start_new_session=True)
         except Exception as e:
             try: self.deiconify(); self.lift(); self.focus_force()
@@ -211,18 +197,15 @@ class App(tk.Tk):
 
         self.status_var.set("Завершаю запись…")
 
-        # 1) аварийный флаг .stop
+        # аварийный .stop
         try:
             rec_dir = Path(self._current_rec.get("rec_dir","")) if hasattr(self,"_current_rec") else None
-            if rec_dir:
-                rec_dir.mkdir(parents=True, exist_ok=True)
-                (rec_dir / ".stop").touch()
+            if rec_dir: rec_dir.mkdir(parents=True, exist_ok=True); (rec_dir / ".stop").touch()
         except Exception: pass
 
-        # 2) шлём сигналы всей группе процесса
+        # сигналы в группу
         try:
-            import os
-            pgid = os.getpgid(self.rec_proc.pid)
+            import os; pgid = os.getpgid(self.rec_proc.pid)
         except Exception:
             pgid = None
 
@@ -251,8 +234,10 @@ class App(tk.Tk):
     # ---- экспорт/очистка ----
     def _export_zip(self):
         default_name = f"dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        save_path = filedialog.asksaveasfilename(title="Экспорт датасета в ZIP",
-            defaultextension=".zip", initialfile=default_name, filetypes=[("ZIP archive","*.zip")])
+        save_path = filedialog.asksaveasfilename(
+            title="Экспорт датасета в ZIP", defaultextension=".zip",
+            initialfile=default_name, filetypes=[("ZIP archive","*.zip")]
+        )
         if not save_path: return
         def worker():
             try:
@@ -273,7 +258,8 @@ class App(tk.Tk):
         if not self.dataset_root_dir.exists():
             messagebox.showinfo("Пусто", "Папка датасета ещё не создана."); return
         ok = messagebox.askyesno("Очистить датасет?",
-            f"Будут удалены ВСЕ записи в:\n{self.dataset_root_dir}\n\nПродолжить?", icon="warning")
+                                 f"Будут удалены ВСЕ записи в:\n{self.dataset_root_dir}\n\nПродолжить?",
+                                 icon="warning")
         if not ok: return
         def worker():
             try:
@@ -328,9 +314,8 @@ class App(tk.Tk):
         while val>=1024 and i<len(units)-1: val/=1024.0; i+=1
         return f"{val:.1f} {units[i]}" if i>0 else f"{int(val)} {units[i]}"
 
-    # ---- watcher завершение ----
+    # ---- завершение ----
     def _on_recorder_stopped(self, returncode: Optional[int], rec_id: str):
-        # вернуть окно, если было свёрнуто
         try: self.deiconify(); self.lift(); self.focus_force()
         except Exception: pass
 
@@ -339,8 +324,7 @@ class App(tk.Tk):
             try: self.after_cancel(self._timer_job)
             except Exception: pass
             self._timer_job = None
-        self.timer_var.set("00:00")
-        self.btn_finish.state(["disabled"])
+        self.timer_var.set("00:00"); self.btn_finish.state(["disabled"])
 
         if returncode not in (None, 0, -2):
             if returncode == -5:
@@ -350,7 +334,7 @@ class App(tk.Tk):
             else:
                 messagebox.showerror("Ошибка записи", f"Дочерний процесс завершился с кодом: {returncode}")
 
-        # submit (если нужно)
+        # submit
         try:
             rec_dir = self.dataset_root_dir / rec_id
             meta_path = rec_dir / "meta.json"
@@ -360,8 +344,43 @@ class App(tk.Tk):
 
         self._fetch_and_show_next_task()
         self.status_var.set("Готово")
-        self.rec_proc = None
         self.btn_start.state(["!disabled"] if self.current_task else ["disabled"])
+        self.rec_proc = None
+
+    # ---- поиск рекордера ----
+    def _find_recorder_binary(self) -> Optional[Path]:
+        # 0) явный путь из окружения
+        env = os.environ.get("RECORDER_BIN", "").strip()
+        if env:
+            p = Path(env)
+            if p.exists(): return p.resolve()
+
+        # база: где лежит бинарь GUI
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).resolve().parent  # exe папка / .app/Contents/MacOS
+        else:
+            base = Path(__file__).resolve().parent
+
+        # кандидаты: рядом с GUI
+        cands: List[Path] = [
+            base / "datagrabber_69.exe",
+            base / "datagrabber_69",
+        ]
+
+        # macOS .app — мы и так в Contents/MacOS, но на всякий
+        if platform.system() == "Darwin":
+            cands.insert(0, Path(sys.executable).resolve().parent / "datagrabber_69")
+
+        for c in cands:
+            if c.exists():
+                return c.resolve()
+
+        # fallback: исходник рядом (режим разработки)
+        py = base / "datagrabber_69.py"
+        if not getattr(sys, "frozen", False) and py.exists():
+            return py.resolve()
+
+        return None
 
     # ---- утилиты ----
     def _tick_timer(self):
@@ -369,13 +388,6 @@ class App(tk.Tk):
         dt = int(time.time() - self.rec_start_time); mm, ss = divmod(dt, 60)
         self.timer_var.set(f"{mm:02d}:{ss:02d}")
         self._timer_job = self.after(1000, self._tick_timer)
-
-    def _find_recorder_script(self) -> Optional[Path]:
-        env_path = os.environ.get("RECORDER_SCRIPT","").strip()
-        if env_path and Path(env_path).exists(): return Path(env_path).resolve()
-        here = Path(__file__).parent
-        p = here / "datagrabber_69.py"
-        return p.resolve() if p.exists() else None
 
     def _detect_operator(self) -> str:
         op = os.environ.get("OPERATOR_NAME","").strip()
@@ -385,7 +397,6 @@ class App(tk.Tk):
         except Exception: return ""
 
     def _on_close(self):
-        # мягко остановим запись при закрытии
         try:
             if self.rec_proc and self.rec_proc.poll() is None:
                 if hasattr(self,"_current_rec"):
@@ -396,7 +407,7 @@ class App(tk.Tk):
                 except Exception:
                     self.rec_proc.send_signal(signal.SIGINT)
         except Exception: pass
-        # очистка таймеров
+        # cancel timers
         if self._timer_job is not None:
             try: self.after_cancel(self._timer_job)
             except Exception: pass
