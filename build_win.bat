@@ -1,44 +1,38 @@
-@echo off
-setlocal
+REM активируй окружение
+.\.venv\Scripts\activate
+pip install -U pyinstaller mss pillow pynput
 
-REM ---- где держать результат и временные файлы ----
+REM создадим чистые папки
 set DIST=build\win
 set WORK=build\_work
 set SPEC=build\_spec
-
-REM ---- (необязательно) иконка GUI, положи icon.ico рядом с .py ----
-set ICON=icon.ico
-
-REM ---- чистим и создаём папки ----
 if exist "%DIST%" rmdir /s /q "%DIST%"
 if exist "%WORK%" rmdir /s /q "%WORK%"
 if exist "%SPEC%" rmdir /s /q "%SPEC%"
-mkdir "%DIST%" 2>nul
-mkdir "%WORK%" 2>nul
-mkdir "%SPEC%" 2>nul
+mkdir "%DIST%" & mkdir "%WORK%" & mkdir "%SPEC%"
 
-REM ---- активируй своё venv заранее! (.venv\Scripts\activate) ----
-REM pip install -U pyinstaller mss pillow pynput
-
-echo [1/3] Building recorder (datagrabber_69)...
+REM 1) recorder (консольный) — с hidden-import/collect
 pyinstaller --clean --noconfirm ^
   --console ^
   --name datagrabber_69 ^
   --distpath "%DIST%" --workpath "%WORK%" --specpath "%SPEC%" ^
+  --hidden-import pynput ^
+  --hidden-import pynput.keyboard ^
+  --hidden-import pynput.mouse ^
+  --collect-submodules pynput ^
+  --collect-submodules PIL ^
+  --collect-submodules mss ^
   datagrabber_69.py
 
-echo [2/3] Building GUI (TkDatasetRecorder)...
+REM 2) GUI (окно, без консоли) — ему обычно не нужны эти пакеты
 pyinstaller --clean --noconfirm ^
   --windowed ^
   --name TkDatasetRecorder ^
   --distpath "%DIST%" --workpath "%WORK%" --specpath "%SPEC%" ^
-  %ICON:%= % ^
   tk_dataset_recorder.py
 
-echo [3/3] Placing recorder next to GUI...
+REM 3) Положим helper рядом с GUI
 copy /Y "%DIST%\datagrabber_69\datagrabber_69.exe" "%DIST%\TkDatasetRecorder\" >nul
 
-echo.
-echo DONE ✅
-echo Launch: "%DIST%\TkDatasetRecorder\TkDatasetRecorder.exe"
-endlocal
+echo DONE
+echo Запуск: "%DIST%\TkDatasetRecorder\TkDatasetRecorder.exe"
